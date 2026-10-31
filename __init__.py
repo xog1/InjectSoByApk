@@ -20,7 +20,7 @@ def inject_and_sign(
         apk_path: str,
         injections: dict,
         hook_so_dir: str = "input_libs",
-        output_dir: str = "dist",
+        output_dir: str = "output_apk",
         output_apk_name: str = "mod_final_signed.apk",
         unpacked_dir: str = "unpacked_dir",
         # 核心改进：允许自定义工具路径，默认自动绑定到本库所在目录下的 jar 包
