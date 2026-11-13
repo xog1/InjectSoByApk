@@ -12,7 +12,9 @@ class ApkModifierError(Exception):
 def _run_cmd(cmd):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        raise ApkModifierError(f"命令执行失败: {cmd}\n错误信息: {result.stderr}")
+        raise ApkModifierError(
+            f"命令执行失败: {cmd}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
     return result.stdout
 
 
@@ -33,6 +35,8 @@ def inject_and_sign(
 ) -> str:
     """
     通用 APK 动态注入与签名函数（路径自适应版）。
+
+    所有中间产物/签名产物均使用绝对路径定位，不再依赖调用方的当前工作目录。
     """
     # 获取当前 py 文件所在的绝对目录（即工具库的根目录）
     lib_root = Path(__file__).resolve().parent
@@ -53,9 +57,9 @@ def inject_and_sign(
     if not apk_file.exists():
         raise FileNotFoundError(f"找不到目标 APK 文件: {apk_path}")
 
-    output_unsigned = Path(unpacked_dir).parent / "output_unsigned.apk"
-    unpacked_path = Path(unpacked_dir)
-    out_dir_path = Path(output_dir)
+    unpacked_path = Path(unpacked_dir).resolve()
+    output_unsigned = unpacked_path.parent / "output_unsigned.apk"
+    out_dir_path = Path(output_dir).resolve()
     out_dir_path.mkdir(parents=True, exist_ok=True)
     final_output_path = out_dir_path / output_apk_name
 
@@ -65,7 +69,7 @@ def inject_and_sign(
             shutil.rmtree(unpacked_path)
 
         # 使用绝对路径执行 apktool
-        _run_cmd(f"java -jar \"{apktool_path}\" d \"{apk_path}\" -o \"{unpacked_dir}\"")
+        _run_cmd(f"java -jar \"{apktool_path}\" d \"{apk_path}\" -o \"{unpacked_path}\"")
 
         print("\n[*] 开始执行多路 .so 依赖注入与文件复制...")
         hook_so_path = Path(hook_so_dir)
@@ -111,26 +115,38 @@ def inject_and_sign(
         print("\n[*] 正在重新打包未签名 APK...")
         if output_unsigned.exists():
             output_unsigned.unlink()
-        _run_cmd(f"java -jar \"{apktool_path}\" b \"{unpacked_dir}\" -o \"{output_unsigned}\"")
+        _run_cmd(f"java -jar \"{apktool_path}\" b \"{unpacked_path}\" -o \"{output_unsigned}\"")
 
         print("\n[*] 正在使用 uber-apk-signer 进行签名与对齐...")
-        # 使用绝对路径执行 signer
-        sign_cmd = f"java -jar \"{signer_path}\" --apks \"{output_unsigned}\" --out ."
+        # 让签名产物直接落在 output_dir 内，并用已经存在的文件集合区分本次产物
+        pre_existing = set(out_dir_path.glob("*signed.apk"))
+        sign_cmd = (
+            f"java -jar \"{signer_path}\" --apks \"{output_unsigned}\" "
+            f"--out \"{out_dir_path}\""
+        )
         if ks_path and ks_pass and ks_alias:
-            sign_cmd += f" --ks \"{ks_path}\" --ksPass {ks_path} --ksAlias {ks_alias}"
+            sign_cmd += f" --ks \"{ks_path}\" --ksPass \"{ks_pass}\" --ksAlias \"{ks_alias}\""
         _run_cmd(sign_cmd)
 
-        signed_candidates = list(Path("../..").glob("*signed.apk"))
+        signed_candidates = [
+            p for p in out_dir_path.glob("*signed.apk") if p not in pre_existing
+        ] or list(out_dir_path.glob("*signed.apk"))
         if not signed_candidates:
-            raise ApkModifierError("签名工具未生成预期的签名 APK 文件。")
+            raise ApkModifierError(
+                f"签名工具未生成预期的签名 APK 文件（输出目录: {out_dir_path}）。"
+            )
 
         latest_signed = max(signed_candidates, key=os.path.getmtime)
+        idsig_path = latest_signed.with_name(latest_signed.name + ".idsig")
         if final_output_path.exists():
             final_output_path.unlink()
         shutil.move(str(latest_signed), str(final_output_path))
+        # v4 签名附属文件（.idsig）对被注入的 APK 没有意义，直接删除避免污染 dist
+        if idsig_path.exists():
+            idsig_path.unlink()
 
-        print(f"\n[+] 处理完成！成品路径: {final_output_path.resolve()}")
-        return str(final_output_path.resolve())
+        print(f"\n[+] 处理完成！成品路径: {final_output_path}")
+        return str(final_output_path)
 
     finally:
         if cleanup:
@@ -139,6 +155,6 @@ def inject_and_sign(
                 shutil.rmtree(unpacked_path)
             if output_unsigned.exists():
                 output_unsigned.unlink()
-            for extra_file in Path("../..").glob("output_unsigned*.apk*"):
-                if extra_file.exists():
+            for extra_file in out_dir_path.glob("output_unsigned*.apk*"):
+                if extra_file.is_file():
                     extra_file.unlink()
